@@ -1,6 +1,7 @@
 package edu.kit.kastel.vads.compiler;
 
 import edu.kit.kastel.vads.compiler.backend.aasm.CodeGenerator;
+import edu.kit.kastel.vads.compiler.backend.aasm.CodeGeneratorx86;
 import edu.kit.kastel.vads.compiler.ir.IrGraph;
 import edu.kit.kastel.vads.compiler.ir.SsaTranslation;
 import edu.kit.kastel.vads.compiler.ir.optimize.LocalValueNumbering;
@@ -21,6 +22,7 @@ import java.util.List;
 
 public class Main {
     public static void main(String[] args) throws IOException {
+        System.out.println("Start compiling");
         if (args.length != 2) {
             System.err.println("Invalid arguments: Expected one input file and one output file");
             System.exit(3);
@@ -38,6 +40,7 @@ public class Main {
         List<IrGraph> graphs = new ArrayList<>();
         for (FunctionTree function : program.topLevelTrees()) {
             SsaTranslation translation = new SsaTranslation(function, new LocalValueNumbering());
+            System.out.println("translation" + translation);
             graphs.add(translation.translate());
         }
 
@@ -50,7 +53,12 @@ public class Main {
         }
 
         // TODO: generate assembly and invoke gcc instead of generating abstract assembly
-        String s = new CodeGenerator().generateCode(graphs);
+        System.out.println("graphs: " + graphs);
+        //String s = new CodeGenerator().generateCode(graphs);
+        String s = new CodeGeneratorx86().generateCode(graphs);
+        System.out.println("\n  \n=========================================================================================================================");
+        System.out.println("Output String: \n" + s);
+        System.out.println("========================================================================================================================= \n  \n ");
         Files.writeString(output, s);
     }
 
