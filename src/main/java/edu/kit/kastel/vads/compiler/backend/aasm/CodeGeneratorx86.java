@@ -278,6 +278,7 @@ public class CodeGeneratorx86 {
      * Allocates a new stack slot for register spilling.
      * Each slot is 8 bytes (64 bits) for our x86-64 implementation.
      *
+     *
      * @return The byte offset from %rbp for this stack slot
      */
     private int allocateStackSlot() {
