@@ -152,8 +152,8 @@ public class CodeGeneratorx86 {
             case AddNode add -> binaryX86(builder, registers, add, "add");
             case SubNode sub -> binaryX86(builder, registers, sub, "sub");
             case MulNode mul -> binaryX86(builder, registers, mul, "mul");
-            case DivNode div -> binaryX86(builder, registers, div, "div");
-            case ModNode mod -> binaryX86(builder, registers, mod, "mod");
+            case DivNode div -> divisionX86(builder, registers, div, true);  // true für Division
+            case ModNode mod -> divisionX86(builder, registers, mod, false); // false für Modulo
             case ReturnNode r -> {
                 // Get the return value
                 String resultReg = registers.get(predecessorSkipProj(r, ReturnNode.RESULT)).toString();
@@ -185,6 +185,61 @@ public class CodeGeneratorx86 {
         }
         builder.append("\n");
     }
+
+    /**
+     * Generates x86-64 assembly code for division or modulo operations.
+     * The x86-64 division instruction (idiv) requires special handling
+     * with specific registers.
+     *
+     * @param builder The StringBuilder to append generated code to
+     * @param virtualRegisters Map of IR nodes to their allocated registers
+     * @param node The division or modulo operation node being processed
+     * @param isDiv True for division, false for modulo
+     */
+    private void divisionX86(
+            StringBuilder builder,
+            Map<Node, Register> virtualRegisters,
+            BinaryOperationNode node,
+            boolean isDiv // false for mod
+    ) {
+        Register targetReg = virtualRegisters.get(node);
+        Register leftReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.LEFT));
+        Register rightReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.RIGHT));
+
+        String x86TargetReg = getX86Register(targetReg);
+        String x86LeftReg = getX86Register(leftReg);
+        String x86RightReg = getX86Register(rightReg);
+
+        // For complex expressions as the right operand, we need to evaluate it first
+        // Check if the right operand is a constant or register
+        boolean rightIsMemory = x86RightReg.contains("(");
+
+        // If the right operand is in memory, load it into a temporary register
+        if (rightIsMemory) {
+            builder.append("    movq ").append(x86RightReg).append(", %r10\n");
+            x86RightReg = "%r10";
+        }
+
+        // x86-64 division requires the dividend in %rax
+        builder.append("    movq ").append(x86LeftReg).append(", %rax\n");
+
+        // Sign-extend %rax into %rdx for signed division
+        builder.append("    cqto\n");
+
+        // Perform the division
+        builder.append("    idivq ").append(x86RightReg).append("\n");
+
+        // Division result is in %rax, remainder is in %rdx
+        // Move the appropriate result to the target register
+        String resultReg = isDiv ? "%rax" : "%rdx";
+
+        // If the target register is not already the result register, move the result
+        if (!x86TargetReg.equals(resultReg)) {
+            builder.append("    movq ").append(resultReg).append(", ").append(x86TargetReg).append("\n");
+        }
+    }
+
+
 
     /**
      * Generates x86-64 assembly code for binary operations (add, sub, mul).
