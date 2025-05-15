@@ -21,7 +21,8 @@ public class CodeGeneratorx86 {
      * registers (%r8 through %r15) available in 64-bit mode.
      */
     private static final String[] AVAILABLE_REGISTERS = {
-            "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi", "%r8", "%r9", "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"
+            "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi", "%r8", "%r9", "%r12", "%r13", "%r14", "%r15"
+            // Note: %r10 and %r11 are reserved for temporary operations
     };
 
     /**
@@ -86,8 +87,15 @@ public class CodeGeneratorx86 {
             builder.append("_").append(graph.name()).append(":\n");
 
             // Function prologue - sets up the stack frame
-            builder.append("    pushq %rbp\n");       // Save the old base pointer
-            builder.append("    movq %rsp, %rbp\n");  // Set new base pointer to current stack pointer
+            // Calculate required stack space for spilled registers
+            int stackSpaceNeeded = calculateStackSpaceNeeded(virtualRegisters.size());
+
+            // Adjust the function prologue to allocate stack space
+            builder.append("    pushq %rbp\n");
+            builder.append("    movq %rsp, %rbp\n");
+            if (stackSpaceNeeded > 0) {
+                builder.append("    subq $").append(stackSpaceNeeded).append(", %rsp\n");
+            }
 
             // Generate the function body
             generateForGraphX86(graph, builder, virtualRegisters);
@@ -95,6 +103,15 @@ public class CodeGeneratorx86 {
             // Note: The function epilogue is handled by the ReturnNode
         }
         return builder.toString();
+    }
+
+    private int calculateStackSpaceNeeded(int virtualRegCount) {
+        int physicalRegCount = AVAILABLE_REGISTERS.length;
+        int spilledRegCount = Math.max(0, virtualRegCount - physicalRegCount);
+
+        // Each register needs 8 bytes, and ensure 16-byte alignment for the stack
+        int bytes = spilledRegCount * 8;
+        return (bytes + 15) & ~15;  // Round up to multiple of 16
     }
 
     /**
@@ -137,8 +154,24 @@ public class CodeGeneratorx86 {
             case MulNode mul -> binaryX86(builder, registers, mul, "mul");
             case DivNode div -> binaryX86(builder, registers, div, "div");
             case ModNode mod -> binaryX86(builder, registers, mod, "mod");
-            case ReturnNode r -> builder.repeat(" ", 2).append("ret ")
-                    .append(registers.get(predecessorSkipProj(r, ReturnNode.RESULT)));
+            case ReturnNode r -> {
+                // Get the return value
+                String resultReg = registers.get(predecessorSkipProj(r, ReturnNode.RESULT)).toString();
+
+                // Move result to %rax (return value register)
+                if (!resultReg.equals("%rax")) {
+                    builder.append("    movq ").append(resultReg).append(", %rax\n");
+                }
+
+                // Function epilogue - restore stack pointer if needed
+                if (currentStackOffset > 16) {
+                    builder.append("    movq %rbp, %rsp\n");
+                }
+
+                // Restore base pointer and return
+                builder.append("    popq %rbp\n");
+                builder.append("    ret");
+            }
             case ConstIntNode c -> builder.repeat(" ", 2)
                     .append(registers.get(c))
                     .append(" = const ")
@@ -168,102 +201,91 @@ public class CodeGeneratorx86 {
                            BinaryOperationNode node,
                            String opcode
     ) {
-        // Get the virtual registers assigned to this operation
         Register targetReg = virtualRegisters.get(node);
         Register leftReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.LEFT));
         Register rightReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.RIGHT));
 
-        // Map virtual registers to actual x86-64 registers
         String x86TargetReg = getX86Register(targetReg);
         String x86LeftReg = getX86Register(leftReg);
         String x86RightReg = getX86Register(rightReg);
 
-        // x86-64 uses two-address instructions (dest is also a source)
-        // If the target register is different from the left operand register,
-        // we need to copy the left operand to the target register first
-        if (!x86TargetReg.equals(x86LeftReg)) {
-            builder.append("    movq ").append(x86LeftReg).append(", ").append(x86TargetReg).append("\n");
-        }
+        // Check if target is a memory location
+        boolean targetIsMemory = x86TargetReg.contains("(");
 
-        // Now perform the operation with the right operand
-        // Format: opcode src, dest (where dest is also used as the first operand)
-        builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(x86TargetReg);
-    }
+        // If target is memory location, we need an intermediate register
+        if (targetIsMemory) {
+            // Use a temporary register (e.g., %r11 which we'll reserve for this purpose)
+            String tempReg = "%r11";
 
-    /**
-     * Generates x86-64 assembly code for division or modulo operations.
-     * Handles the special requirements of x86-64 division, which uses fixed
-     * registers (%rax for dividend and quotient, %rdx for remainder).
-     *
-     * @param builder The StringBuilder to append generated code to
-     * @param virtualRegisters Map of IR nodes to their allocated virtual registers
-     * @param node The division or modulo operation node being processed
-     * @param isDiv True if this is a division operation, false if it's a modulo operation
-     */
-    private void divisionX86(
-            StringBuilder builder,
-            Map<Node, Register> virtualRegisters,
-            BinaryOperationNode node,
-            boolean isDiv // false for mod
-    ) {
-        // Get the virtual registers assigned to this operation
-        Register targetReg = virtualRegisters.get(node);
-        Register leftReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.LEFT));
-        Register rightReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.RIGHT));
+            // Load left operand into temp register
+            builder.append("    movq ").append(x86LeftReg).append(", ").append(tempReg).append("\n");
 
-        // Map virtual registers to actual x86-64 registers
-        String x86TargetReg = getX86Register(targetReg);
-        String x86LeftReg = getX86Register(leftReg);
-        String x86RightReg = getX86Register(rightReg);
+            // Perform operation with right operand
+            builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(tempReg).append("\n");
 
-        // Division on x86-64 requires specific register usage:
-        // - Dividend must be in %rax
-        // - Division result (quotient) is placed in %rax
-        // - Remainder is placed in %rdx
+            // Store result back to memory
+            builder.append("    movq ").append(tempReg).append(", ").append(x86TargetReg);
+        } else {
+            // Target is a register - proceed as before
+            if (!x86TargetReg.equals(x86LeftReg)) {
+                // If left operand is in memory, use movq to load it
+                builder.append("    movq ").append(x86LeftReg).append(", ").append(x86TargetReg).append("\n");
+            }
 
-        // Move the dividend (left operand) to %rax
-        builder.append("    movq ").append(x86LeftReg).append(", %rax\n");
-
-        // Sign-extend %rax into %rdx (required before signed division)
-        builder.append("    cqto\n");
-
-        // Perform the division operation
-        builder.append("    idivq ").append(x86RightReg).append("\n");
-
-        // Determine which register contains our result (quotient or remainder)
-        String resultReg = isDiv ? "%rax" : "%rdx";
-
-        // If the target register is not already the result register,
-        // copy the result to the target register
-        if (!x86TargetReg.equals(resultReg)) {
-            builder.append("    movq ").append(resultReg).append(", ").append(x86TargetReg);
+            // If right operand is in memory and operation requires a register, handle specially
+            if (x86RightReg.contains("(") && (opcode.equals("imul") || opcode.equals("idiv"))) {
+                // For operations that can't take a memory operand directly
+                String tempReg = "%r10";  // Use a reserved temporary register
+                builder.append("    movq ").append(x86RightReg).append(", ").append(tempReg).append("\n");
+                builder.append("    ").append(opcode).append(" ").append(tempReg).append(", ").append(x86TargetReg);
+            } else {
+                // For operations that can take a memory operand
+                builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(x86TargetReg);
+            }
         }
     }
 
+
+
     /**
-     * Maps a virtual register to a physical x86-64 register.
-     * If the virtual register hasn't been mapped yet, assigns the next
-     * available register from AVAILABLE_REGISTERS.
+     * Maps a virtual register to a physical x86-64 register or a stack location.
+     * If all physical registers are in use, some values will be "spilled" to memory.
      *
      * @param virtualReg The virtual register to map
-     * @return The corresponding x86-64 register name
-     * @throws UnsupportedOperationException if all available registers are used
-     *         and register spilling to memory would be required
+     * @return The corresponding x86-64 register name or a stack reference
      */
     private String getX86Register(Register virtualReg) {
         if (!registerMapping.containsKey(virtualReg)) {
-            // If this virtual register hasn't been assigned an x86 register yet, assign one
             if (nextRegisterIndex < AVAILABLE_REGISTERS.length) {
-                // Get the next available register and increment the index
+                // Assign a physical register if available
                 String x86Reg = AVAILABLE_REGISTERS[nextRegisterIndex++];
                 registerMapping.put(virtualReg, x86Reg);
             } else {
-                // We've run out of registers - in a real implementation, we would
-                // spill some registers to memory (stack) at this point
-                throw new UnsupportedOperationException("Register spilling not implemented, too many registers needed");
+                // Implement register spilling to stack
+                // Allocate a new stack slot (relative to %rbp)
+                int stackOffset = allocateStackSlot();
+                String stackLocation = String.format("%d(%%rbp)", -stackOffset);
+                registerMapping.put(virtualReg, stackLocation);
             }
         }
         return registerMapping.get(virtualReg);
+    }
+
+    // Track stack space needed for register spilling
+    private int currentStackOffset = 16; // Start after saved %rbp and return address
+
+    /**
+     * Allocates a new stack slot for register spilling.
+     * Each slot is 8 bytes (64 bits) for our x86-64 implementation.
+     *
+     * @return The byte offset from %rbp for this stack slot
+     */
+    private int allocateStackSlot() {
+        // Ensure stack alignment (8 bytes for 64-bit values)
+        currentStackOffset = (currentStackOffset + 7) & ~7;
+        int offset = currentStackOffset;
+        currentStackOffset += 8; // Allocate 8 bytes
+        return offset;
     }
 
 
