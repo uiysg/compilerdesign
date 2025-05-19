@@ -141,7 +141,6 @@ public class CodeGeneratorx86 {
     protected void scan(Node node, Set<Node> visited, StringBuilder builder, Map<Node, Register> registers) {
         // First process all predecessors not yet visited
         for (Node predecessor : node.predecessors()) {
-            // The add() method returns true if the element was added (wasn't already in the set)
             if (visited.add(predecessor)) {
                 scan(predecessor, visited, builder, registers);
             }
@@ -149,41 +148,78 @@ public class CodeGeneratorx86 {
 
         // Generate code for the current node based on its type
         switch (node) {
-            case AddNode add -> binaryX86(builder, registers, add, "add");
-            case SubNode sub -> binaryX86(builder, registers, sub, "sub");
-            case MulNode mul -> binaryX86(builder, registers, mul, "mul");
-            case DivNode div -> divisionX86(builder, registers, div, true);  // true für Division
-            case ModNode mod -> divisionX86(builder, registers, mod, false); // false für Modulo
+            case AddNode add -> binaryX86(builder, registers, add, "addq");
+            case SubNode sub -> binaryX86(builder, registers, sub, "subq");
+            case MulNode mul -> multiplyX86(builder, registers, mul);
+            case DivNode div -> divisionX86(builder, registers, div, true);  // true for division
+            case ModNode mod -> divisionX86(builder, registers, mod, false); // false for modulo
+            case ConstIntNode c -> {
+                // Get the target register for this constant
+                Register targetReg = registers.get(c);
+                String x86TargetReg = getX86Register(targetReg);
+
+                // Generate proper x86 instruction to load the constant
+                builder.append("    movq $").append(c.value()).append(", ").append(x86TargetReg).append("\n");
+            }
             case ReturnNode r -> {
-                // Get the return value
-                String resultReg = registers.get(predecessorSkipProj(r, ReturnNode.RESULT)).toString();
+                // Get the return value node
+                Node returnValue = predecessorSkipProj(r, ReturnNode.RESULT);
+                Register resultReg = registers.get(returnValue);
+                String x86ResultReg = getX86Register(resultReg);
 
                 // Move result to %rax (return value register)
-                if (!resultReg.equals("%rax")) {
-                    builder.append("    movq ").append(resultReg).append(", %rax\n");
+                if (!x86ResultReg.equals("%rax")) {
+                    builder.append("    movq ").append(x86ResultReg).append(", %rax\n");
                 }
 
-                // Function epilogue - restore stack pointer if needed
-                if (currentStackOffset > 16) {
-                    builder.append("    movq %rbp, %rsp\n");
-                }
-
-                // Restore base pointer and return
+                // Function epilogue - restore stack pointer
+                builder.append("    movq %rbp, %rsp\n");
                 builder.append("    popq %rbp\n");
-                builder.append("    ret");
+                builder.append("    ret\n");
             }
-            case ConstIntNode c -> builder.repeat(" ", 2)
-                    .append(registers.get(c))
-                    .append(" = const ")
-                    .append(c.value());
             case Phi _ -> throw new UnsupportedOperationException("phi");
             case Block _, ProjNode _, StartNode _ -> {
                 // These node types don't generate assembly instructions
                 // Skip adding a newline
                 return;
             }
+            default -> throw new UnsupportedOperationException("Unsupported node type: " + node.getClass().getSimpleName());
         }
-        builder.append("\n");
+    }
+
+    /**
+     * Specialized multiplication handler for x86
+     */
+    private void multiplyX86(StringBuilder builder,
+                             Map<Node, Register> virtualRegisters,
+                             MulNode node) {
+        Register targetReg = virtualRegisters.get(node);
+        Register leftReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.LEFT));
+        Register rightReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.RIGHT));
+
+        String x86TargetReg = getX86Register(targetReg);
+        String x86LeftReg = getX86Register(leftReg);
+        String x86RightReg = getX86Register(rightReg);
+
+        // x86 multiplication requires one operand to be in %rax
+        // Result is stored in %rdx:%rax (high:low)
+
+        // Move left operand to %rax
+        builder.append("    movq ").append(x86LeftReg).append(", %rax\n");
+
+        // Perform multiplication (imulq can take 2 operands, but mulq cannot)
+        if (x86RightReg.contains("(")) {
+            // Memory operand
+            builder.append("    mulq ").append(x86RightReg).append("\n");
+        } else {
+            // Register operand
+            builder.append("    mulq ").append(x86RightReg).append("\n");
+        }
+
+        // Move result from %rax to target register (ignoring overflow in %rdx)
+        if (!x86TargetReg.equals("%rax")) {
+            builder.append("    movq %rax, ").append(x86TargetReg).append("\n");
+        }
     }
 
     /**
@@ -210,30 +246,17 @@ public class CodeGeneratorx86 {
         String x86LeftReg = getX86Register(leftReg);
         String x86RightReg = getX86Register(rightReg);
 
-        // For complex expressions as the right operand, we need to evaluate it first
-        // Check if the right operand is a constant or register
-        boolean rightIsMemory = x86RightReg.contains("(");
-
-        // If the right operand is in memory, load it into a temporary register
-        if (rightIsMemory) {
-            builder.append("    movq ").append(x86RightReg).append(", %r10\n");
-            x86RightReg = "%r10";
-        }
-
-        // x86-64 division requires the dividend in %rax
+        // Move the dividend to %rax
         builder.append("    movq ").append(x86LeftReg).append(", %rax\n");
 
-        // Sign-extend %rax into %rdx for signed division
+        // Sign-extend %rax into %rdx
         builder.append("    cqto\n");
 
-        // Perform the division
+        // If the divisor is in memory, we can use it directly with idivq
         builder.append("    idivq ").append(x86RightReg).append("\n");
 
-        // Division result is in %rax, remainder is in %rdx
-        // Move the appropriate result to the target register
+        // Move the result (quotient in %rax, remainder in %rdx) to the target register
         String resultReg = isDiv ? "%rax" : "%rdx";
-
-        // If the target register is not already the result register, move the result
         if (!x86TargetReg.equals(resultReg)) {
             builder.append("    movq ").append(resultReg).append(", ").append(x86TargetReg).append("\n");
         }
@@ -254,8 +277,7 @@ public class CodeGeneratorx86 {
     private void binaryX86(StringBuilder builder,
                            Map<Node, Register> virtualRegisters,
                            BinaryOperationNode node,
-                           String opcode
-    ) {
+                           String opcode) {
         Register targetReg = virtualRegisters.get(node);
         Register leftReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.LEFT));
         Register rightReg = virtualRegisters.get(predecessorSkipProj(node, BinaryOperationNode.RIGHT));
@@ -264,40 +286,13 @@ public class CodeGeneratorx86 {
         String x86LeftReg = getX86Register(leftReg);
         String x86RightReg = getX86Register(rightReg);
 
-        // Check if target is a memory location
-        boolean targetIsMemory = x86TargetReg.contains("(");
-
-        // If target is memory location, we need an intermediate register
-        if (targetIsMemory) {
-            // Use a temporary register (e.g., %r11 which we'll reserve for this purpose)
-            String tempReg = "%r11";
-
-            // Load left operand into temp register
-            builder.append("    movq ").append(x86LeftReg).append(", ").append(tempReg).append("\n");
-
-            // Perform operation with right operand
-            builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(tempReg).append("\n");
-
-            // Store result back to memory
-            builder.append("    movq ").append(tempReg).append(", ").append(x86TargetReg);
-        } else {
-            // Target is a register - proceed as before
-            if (!x86TargetReg.equals(x86LeftReg)) {
-                // If left operand is in memory, use movq to load it
-                builder.append("    movq ").append(x86LeftReg).append(", ").append(x86TargetReg).append("\n");
-            }
-
-            // If right operand is in memory and operation requires a register, handle specially
-            if (x86RightReg.contains("(") && (opcode.equals("imul") || opcode.equals("idiv"))) {
-                // For operations that can't take a memory operand directly
-                String tempReg = "%r10";  // Use a reserved temporary register
-                builder.append("    movq ").append(x86RightReg).append(", ").append(tempReg).append("\n");
-                builder.append("    ").append(opcode).append(" ").append(tempReg).append(", ").append(x86TargetReg);
-            } else {
-                // For operations that can take a memory operand
-                builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(x86TargetReg);
-            }
+        // For add/sub: First operand needs to be in the target register
+        if (!x86TargetReg.equals(x86LeftReg)) {
+            builder.append("    movq ").append(x86LeftReg).append(", ").append(x86TargetReg).append("\n");
         }
+
+        // Then perform the operation with the second operand
+        builder.append("    ").append(opcode).append(" ").append(x86RightReg).append(", ").append(x86TargetReg).append("\n");
     }
 
 
@@ -310,20 +305,22 @@ public class CodeGeneratorx86 {
      * @return The corresponding x86-64 register name or a stack reference
      */
     private String getX86Register(Register virtualReg) {
-        if (!registerMapping.containsKey(virtualReg)) {
-            if (nextRegisterIndex < AVAILABLE_REGISTERS.length) {
-                // Assign a physical register if available
-                String x86Reg = AVAILABLE_REGISTERS[nextRegisterIndex++];
-                registerMapping.put(virtualReg, x86Reg);
-            } else {
-                // Implement register spilling to stack
-                // Allocate a new stack slot (relative to %rbp)
-                int stackOffset = allocateStackSlot();
-                String stackLocation = String.format("%d(%%rbp)", -stackOffset);
-                registerMapping.put(virtualReg, stackLocation);
-            }
+        if (registerMapping.containsKey(virtualReg)) {
+            return registerMapping.get(virtualReg);
         }
-        return registerMapping.get(virtualReg);
+
+        if (nextRegisterIndex < AVAILABLE_REGISTERS.length) {
+            // Assign a physical register
+            String x86Reg = AVAILABLE_REGISTERS[nextRegisterIndex++];
+            registerMapping.put(virtualReg, x86Reg);
+            return x86Reg;
+        } else {
+            // Spill to stack
+            int offset = allocateStackSlot();
+            String stackLocation = "-" + offset + "(%rbp)";
+            registerMapping.put(virtualReg, stackLocation);
+            return stackLocation;
+        }
     }
 
     // Track stack space needed for register spilling
@@ -337,10 +334,10 @@ public class CodeGeneratorx86 {
      * @return The byte offset from %rbp for this stack slot
      */
     private int allocateStackSlot() {
-        // Ensure stack alignment (8 bytes for 64-bit values)
-        currentStackOffset = (currentStackOffset + 7) & ~7;
+        // Ensure stack alignment
+        currentStackOffset = (currentStackOffset + 15) & ~15;
         int offset = currentStackOffset;
-        currentStackOffset += 8; // Allocate 8 bytes
+        currentStackOffset += 16; // Allocate 16 bytes for alignment
         return offset;
     }
 
